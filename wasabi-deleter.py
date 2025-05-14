@@ -80,14 +80,25 @@ def delete_all_objects(bucket_name):
 
             if objects_to_delete:
                 for i in range(0, len(objects_to_delete), 1000):
-                    chunk = objects_to_delete[i:i+1000]
-                    print(f"    Deleting chunk of {len(chunk)} objects...")
-                    s3_bucket.delete_objects(
-                        Bucket=bucket_name,
-                        Delete={'Objects': chunk, 'Quiet': True}
-                    )
-                    deleted_count += len(chunk)
-                    print(f"    Deleted so far: {deleted_count}")
+                    chunk = objects_to_delete[i:i + 1000]
+                    # Guard against accidentally sending empty batches
+                    if not chunk:
+                        continue
+                    # Ensure every object has a Key and VersionId
+                    valid_chunk = [
+                        obj for obj in chunk if 'Key' in obj and 'VersionId' in obj
+                    ]
+                    if not valid_chunk:
+                        continue
+                    try:
+                        s3_bucket.delete_objects(
+                            Bucket=bucket_name,
+                            Delete={'Objects': valid_chunk, 'Quiet': True}
+                        )
+                        deleted_count += len(valid_chunk)
+                        print(f"    Deleted so far: {deleted_count}")
+                    except botocore.exceptions.ClientError as e:
+                        print(f"    Error deleting objects batch: {e}")
 
         print(f"\nCompleted clearing all objects from bucket '{bucket_name}' ({deleted_count} deleted).")
         return True
