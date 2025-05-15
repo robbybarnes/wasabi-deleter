@@ -2,6 +2,7 @@ import boto3
 import botocore
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === Wasabi Configuration ===
 WASABI_ACCESS_KEY = 'your-access-key'
@@ -48,63 +49,79 @@ def confirm(prompt):
     ans = input(f"{prompt} (y/N): ").strip().lower()
     return ans == 'y'
 
-def delete_all_objects(bucket_name):
+def abort_incomplete_uploads(s3_bucket, bucket_name):
+    paginator = s3_bucket.get_paginator('list_multipart_uploads')
+    for page in paginator.paginate(Bucket=bucket_name):
+        uploads = page.get('Uploads', [])
+        for upload in uploads:
+            try:
+                s3_bucket.abort_multipart_upload(
+                    Bucket=bucket_name, Key=upload['Key'], UploadId=upload['UploadId']
+                )
+                print(f"  Aborted multipart upload: {upload['Key']}")
+            except botocore.exceptions.ClientError as e:
+                print(f"  Error aborting multipart upload {upload['Key']}: {e}")
+
+def delete_object_batch(s3_bucket, bucket_name, objects_to_delete):
+    try:
+        s3_bucket.delete_objects(
+            Bucket=bucket_name,
+            Delete={'Objects': objects_to_delete, 'Quiet': True}
+        )
+        return len(objects_to_delete)
+    except botocore.exceptions.ClientError as e:
+        print(f"    Error deleting objects batch: {e}")
+        return 0
+
+def delete_all_objects(bucket_name, max_workers=4):
     print(f"\n--- Deleting objects in bucket: {bucket_name} ---")
     s3_bucket = get_s3_client_for_bucket(bucket_name)
-    paginator = s3_bucket.get_paginator('list_object_versions')
-    deleted_count = 0
-    page_num = 0
+    total_deleted = 0
+    last_deleted = -1
 
-    try:
+    # Abort incomplete multipart uploads first
+    abort_incomplete_uploads(s3_bucket, bucket_name)
+
+    while last_deleted != 0:  # Repeat until no deletions in a pass
+        paginator = s3_bucket.get_paginator('list_object_versions')
+        objects_batches = []
+        last_deleted = 0
+
         for page in paginator.paginate(Bucket=bucket_name):
-            page_num += 1
-            print(f"Loaded page {page_num} of object versions")
-            objects_to_delete = []
-
             versions = page.get('Versions', [])
             markers = page.get('DeleteMarkers', [])
+            objects_to_delete = [
+                {"Key": v["Key"], "VersionId": v["VersionId"]} for v in versions
+            ] + [
+                    {"Key": m["Key"], "VersionId": m["VersionId"]} for m in markers
+                ]
 
-            print(f"  Found {len(versions)} versions and {len(markers)} delete markers on this page.")
+            # Batch up to 1000
+            for i in range(0, len(objects_to_delete), 1000):
+                objects_batches.append(objects_to_delete[i:i + 1000])
 
-            for version in versions:
-                objects_to_delete.append({
-                    'Key': version['Key'],
-                    'VersionId': version['VersionId']
-                })
+        if objects_batches:
+            print(f"  Found {sum(len(b) for b in objects_batches)} items to delete in {len(objects_batches)} batches.")
 
-            for marker in markers:
-                objects_to_delete.append({
-                    'Key': marker['Key'],
-                    'VersionId': marker['VersionId']
-                })
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(delete_object_batch, s3_bucket, bucket_name, batch)
+                    for batch in objects_batches
+                ]
+                for future in as_completed(futures):
+                    deleted = future.result()
+                    total_deleted += deleted
+                    last_deleted += deleted
+                    print(f"    Deleted so far: {total_deleted}")
 
-            if objects_to_delete:
-                for i in range(0, len(objects_to_delete), 1000):
-                    chunk = objects_to_delete[i:i + 1000]
-                    # Guard against accidentally sending empty batches
-                    if not chunk:
-                        continue
-                    # Ensure every object has a Key and VersionId
-                    valid_chunk = [
-                        obj for obj in chunk if 'Key' in obj and 'VersionId' in obj
-                    ]
-                    if not valid_chunk:
-                        continue
-                    try:
-                        s3_bucket.delete_objects(
-                            Bucket=bucket_name,
-                            Delete={'Objects': valid_chunk, 'Quiet': True}
-                        )
-                        deleted_count += len(valid_chunk)
-                        print(f"    Deleted so far: {deleted_count}")
-                    except botocore.exceptions.ClientError as e:
-                        print(f"    Error deleting objects batch: {e}")
+        else:
+            last_deleted = 0  # no more to delete
 
-        print(f"\nCompleted clearing all objects from bucket '{bucket_name}' ({deleted_count} deleted).")
-        return True
-    except botocore.exceptions.ClientError as e:
-        print(f"\nError clearing bucket '{bucket_name}': {e}")
-        return False
+        # Also handle incomplete multipart uploads (again, just in case)
+        abort_incomplete_uploads(s3_bucket, bucket_name)
+
+    print(f"\nCompleted clearing all objects from bucket '{bucket_name}' ({total_deleted} deleted).")
+    return True
 
 def delete_bucket(bucket_name):
     """Delete bucket (using correct regional client)"""
