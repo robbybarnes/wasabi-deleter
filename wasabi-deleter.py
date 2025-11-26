@@ -293,11 +293,13 @@ class WasabiBucketCleaner:
                     )
                     time.sleep(delay)
                     self.stats.increment_retried(len(errors))
-                    failed_objects = [
-                        {"Key": err["Key"], "VersionId": err.get("VersionId")}
-                        for err in errors
-                        if "Key" in err
-                    ]
+                    failed_objects = []
+                    for err in errors:
+                        if "Key" in err:
+                            obj_identifier = {"Key": err["Key"]}
+                            if version_id := err.get("VersionId"):
+                                obj_identifier["VersionId"] = version_id
+                            failed_objects.append(obj_identifier)
                     return self._delete_object_batch_with_retry(
                         s3_client, bucket_name, failed_objects, retry_count + 1
                     )
