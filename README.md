@@ -19,10 +19,10 @@ A robust Python tool for completely deleting Wasabi S3 buckets and all their con
 
 ## Requirements
 
-- Python 3.6+
-- boto3
-- botocore
-- requests
+- Python 3.9+
+- boto3 >= 1.26.0
+- botocore >= 1.29.0
+- requests >= 2.28.0
 
 ## Installation
 
@@ -34,7 +34,7 @@ cd wasabi-bucket-cleaner
 
 2. Install dependencies:
 ```bash
-pip install boto3 requests
+pip install -r requirements.txt
 ```
 
 ## Configuration
@@ -48,9 +48,11 @@ export WASABI_SECRET_KEY='your-secret-key'
 
 ## Usage
 
-Run the script:
+### Interactive Mode
+
+Run the script without arguments for interactive mode:
 ```bash
-python wasabi_bucket_cleaner.py
+python wasabi-deleter.py
 ```
 
 The script will:
@@ -62,11 +64,41 @@ The script will:
 
 ### Command Line Options
 
-Currently, the script runs interactively. Future versions may include command-line arguments for:
-- Non-interactive mode
-- Specific bucket selection
-- Dry-run mode
-- Custom worker count and batch sizes
+```
+usage: wasabi-deleter.py [-h] [--bucket BUCKET] [--yes] [--list] [--force]
+                         [--workers WORKERS] [--verbose]
+
+options:
+  -h, --help            show this help message and exit
+  --bucket, -b BUCKET   Specific bucket to delete
+  --yes, -y             Skip confirmation prompts
+  --list, -l            List buckets without deleting
+  --force, -f           Use Wasabi force_delete if standard delete fails
+  --workers, -w WORKERS Number of concurrent workers (default: 10)
+  --verbose, -v         Enable verbose logging
+```
+
+### Examples
+
+```bash
+# Interactive mode - list and select buckets
+python wasabi-deleter.py
+
+# Delete a specific bucket
+python wasabi-deleter.py --bucket my-bucket
+
+# Delete without confirmation prompts (use with caution!)
+python wasabi-deleter.py --bucket my-bucket --yes
+
+# List all buckets without deleting
+python wasabi-deleter.py --list
+
+# Use force delete with verbose output
+python wasabi-deleter.py --bucket my-bucket --force --verbose
+
+# Increase worker count for faster deletion
+python wasabi-deleter.py --bucket my-bucket --workers 20
+```
 
 ## How It Works
 
@@ -103,21 +135,24 @@ After deletion attempts:
 
 ## Performance Tuning
 
-The script includes several configurable parameters for performance tuning:
+The script uses a `WasabiConfig` dataclass with the following configurable parameters:
 
-```python
-MAX_WORKERS = 10          # Number of concurrent threads
-BATCH_SIZE = 500          # Objects per batch
-MAX_RETRIES = 5          # Maximum retry attempts
-RETRY_DELAY = 1.0        # Initial retry delay (seconds)
-CONNECTION_POOL_SIZE = 20 # Connection pool size
-RATE_LIMIT_DELAY = 0.1   # Delay between requests
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_workers` | 10 | Number of concurrent threads (adjustable via `--workers` flag) |
+| `batch_size` | 500 | Objects per batch deletion request |
+| `max_retries` | 5 | Maximum retry attempts for failed operations |
+| `retry_delay` | 1.0 | Initial retry delay in seconds |
+| `max_retry_delay` | 30.0 | Maximum retry delay cap |
+| `connection_pool_size` | 20 | Connection pool size for HTTP connections |
+| `rate_limit_delay` | 0.1 | Delay between requests to avoid rate limiting |
 
-Adjust these values based on:
-- Your network bandwidth
-- Bucket size and object count
-- Wasabi API rate limits
+### Tuning Tips
+
+- **Large buckets**: Increase `--workers` to 15-20 for faster deletion
+- **Rate limiting issues**: Reduce `--workers` to 5 or less
+- **Network bandwidth**: Adjust workers based on available bandwidth
+- **Server errors**: The script automatically reduces workers on repeated errors
 
 ## Troubleshooting
 
@@ -142,13 +177,15 @@ Adjust these values based on:
 
 ### Debug Mode
 
-To enable debug logging, modify the logging level in the script:
-```python
-logging.basicConfig(
-    level=logging.DEBUG,  # Change from INFO to DEBUG
-    ...
-)
+Enable verbose/debug logging using the `--verbose` or `-v` flag:
+```bash
+python wasabi-deleter.py --verbose
 ```
+
+This will show detailed information including:
+- Object keys with special characters
+- Individual deletion attempts
+- Retry operations and timing
 
 ## Security Considerations
 
