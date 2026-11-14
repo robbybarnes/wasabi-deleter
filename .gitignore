@@ -1,2 +1,5 @@
 .claude/settings.local.json
-__pycache__/wasabi-deleter.cpython-314.pyc
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/

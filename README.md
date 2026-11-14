@@ -6,14 +6,15 @@ A robust Python tool for completely deleting Wasabi S3 buckets and all their con
 
 - **Complete Bucket Deletion**: Removes all objects, versions, and delete markers
 - **Special Character Handling**: Properly handles objects with unicode characters, spaces, and special symbols
-- **Parallel Processing**: Uses multi-threading for fast deletion of large buckets
+- **Parallel, Streaming Processing**: Listing and deletion are pipelined across threads, so memory stays flat even for buckets with millions of versions
 - **Automatic Retry Logic**: Implements exponential backoff for handling rate limits and server errors
 - **Versioning Support**: Handles versioned buckets by suspending versioning and deleting all versions
 - **Cleanup Operations**:
   - Removes bucket policies and lifecycle rules
   - Aborts incomplete multipart uploads
   - Verifies bucket is empty before deletion
-- **Force Delete**: Supports Wasabi's force_delete parameter as a last resort
+- **Force Delete**: Supports Wasabi's force_delete parameter as a last resort (`--force`)
+- **Safe by Default**: Deleting every bucket non-interactively requires an explicit `--all`; exits non-zero if any bucket fails
 - **Progress Tracking**: Real-time progress updates and performance statistics
 - **Error Recovery**: Automatically falls back to individual object deletion when batch operations fail
 
@@ -22,14 +23,13 @@ A robust Python tool for completely deleting Wasabi S3 buckets and all their con
 - Python 3.9+
 - boto3 >= 1.26.0
 - botocore >= 1.29.0
-- requests >= 2.28.0
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/wasabi-bucket-cleaner.git
-cd wasabi-bucket-cleaner
+git clone https://github.com/robbybarnes/wasabi-deleter.git
+cd wasabi-deleter
 ```
 
 2. Install dependencies:
@@ -57,7 +57,7 @@ python wasabi-deleter.py
 
 The script will:
 1. List all buckets in your Wasabi account
-2. Ask for confirmation before deleting each bucket
+2. Ask whether to delete all of them; if you answer no, it asks about each bucket in turn
 3. Delete all objects, versions, and delete markers
 4. Remove bucket configuration (policies, lifecycle rules)
 5. Delete the empty bucket
@@ -65,17 +65,27 @@ The script will:
 ### Command Line Options
 
 ```
-usage: wasabi-deleter.py [-h] [--bucket BUCKET] [--yes] [--list] [--force]
-                         [--workers WORKERS] [--verbose]
+usage: wasabi-deleter.py [-h] [--bucket BUCKET] [--all] [--yes] [--list]
+                         [--force] [--workers WORKERS]
+                         [--batch-size BATCH_SIZE] [--verbose]
 
 options:
   -h, --help            show this help message and exit
-  --bucket, -b BUCKET   Specific bucket to delete
+  --bucket, -b BUCKET   Bucket to delete (repeatable)
+  --all                 Target every bucket in the account (required with
+                        --yes when no --bucket is given)
   --yes, -y             Skip confirmation prompts
   --list, -l            List buckets without deleting
-  --force, -f           Use Wasabi force_delete if standard delete fails
+  --force, -f           Use Wasabi force_delete if the bucket cannot be
+                        emptied or standard delete fails
   --workers, -w WORKERS Number of concurrent workers (default: 10)
+  --batch-size BATCH_SIZE
+                        Objects per delete request, 1-1000 (default: 500)
   --verbose, -v         Enable verbose logging
+
+Exit status is 0 on success, 1 if any selected bucket could not be deleted.
+`--yes` without `--bucket` or `--all` is rejected, so a stray `-y` can never
+wipe the whole account.
 ```
 
 ### Examples
@@ -87,8 +97,14 @@ python wasabi-deleter.py
 # Delete a specific bucket
 python wasabi-deleter.py --bucket my-bucket
 
+# Delete several buckets
+python wasabi-deleter.py -b logs-2023 -b logs-2024
+
 # Delete without confirmation prompts (use with caution!)
 python wasabi-deleter.py --bucket my-bucket --yes
+
+# Delete EVERY bucket in the account without prompting (be very sure)
+python wasabi-deleter.py --all --yes
 
 # List all buckets without deleting
 python wasabi-deleter.py --list
@@ -103,18 +119,18 @@ python wasabi-deleter.py --bucket my-bucket --workers 20
 ## How It Works
 
 ### 1. **Multi-Region Support**
-The script automatically detects the region of each bucket and uses the appropriate regional endpoint for optimal performance.
+The script automatically detects the region of each bucket and uses the matching regional endpoint and signing region.
 
 ### 2. **Batch Deletion with Fallback**
-- Attempts to delete objects in batches of 500 for efficiency
+- Streams object versions and deletes them in batches of 500 (configurable with `--batch-size`) while listing continues
 - If batch deletion fails (e.g., due to special characters causing MalformedXML errors), automatically falls back to individual object deletion
-- Implements retry logic with exponential backoff for handling temporary failures
+- Retries transient failures (5xx, `SlowDown`, `InternalError`, timeouts) with jittered exponential backoff; permanent per-object errors such as `AccessDenied` are reported once with their error code instead of being retried
 
 ### 3. **Handling Versioned Buckets**
 - Detects if versioning is enabled
 - Suspends versioning to prevent new versions during deletion
 - Deletes all object versions and delete markers
-- Performs multiple passes to ensure all versions are removed
+- Re-scans the bucket until it is empty or a pass makes no progress
 
 ### 4. **Error Handling**
 - **MalformedXML Errors**: Automatically switches to individual object deletion
@@ -129,9 +145,8 @@ Before deleting objects:
 - Aborts incomplete multipart uploads
 
 After deletion attempts:
-- Verifies the bucket is truly empty
-- Performs a final aggressive cleanup if needed
-- Uses Wasabi's force_delete parameter as a last resort
+- Verifies the bucket is truly empty, and only then deletes it
+- With `--force`, uses Wasabi's force_delete parameter if the bucket could not be emptied or standard deletion fails
 
 ## Performance Tuning
 
@@ -140,7 +155,7 @@ The script uses a `WasabiConfig` dataclass with the following configurable param
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_workers` | 10 | Number of concurrent threads (adjustable via `--workers` flag) |
-| `batch_size` | 500 | Objects per batch deletion request |
+| `batch_size` | 500 | Objects per batch deletion request (adjustable via `--batch-size`) |
 | `max_retries` | 5 | Maximum retry attempts for failed operations |
 | `retry_delay` | 1.0 | Initial retry delay in seconds |
 | `max_retry_delay` | 30.0 | Maximum retry delay cap |
@@ -159,7 +174,7 @@ The script uses a `WasabiConfig` dataclass with the following configurable param
 ### Common Issues
 
 1. **"BucketNotEmpty" Error**
-   - The script will automatically try force_delete
+   - Re-run the script, or pass `--force` to let Wasabi delete the remainder
    - Check for objects with active object lock
    - Verify all delete markers are removed
 
@@ -169,7 +184,7 @@ The script uses a `WasabiConfig` dataclass with the following configurable param
 
 3. **Rate Limiting**
    - The script implements automatic backoff
-   - Consider reducing MAX_WORKERS if you see many 503 errors
+   - Consider reducing `--workers` if you see many 503 errors
 
 4. **Object Lock**
    - Objects with compliance mode locks cannot be deleted until the retention period expires
@@ -183,9 +198,9 @@ python wasabi-deleter.py --verbose
 ```
 
 This will show detailed information including:
-- Object keys with special characters
-- Individual deletion attempts
+- Individual deletion attempts and failures
 - Retry operations and timing
+- botocore request details
 
 ## Security Considerations
 
@@ -193,6 +208,7 @@ This will show detailed information including:
 - Use IAM policies to limit access to specific buckets
 - Consider using temporary credentials for enhanced security
 - The script requires the following S3 permissions:
+  - `s3:ListAllMyBuckets`
   - `s3:ListBucket`
   - `s3:ListBucketVersions`
   - `s3:DeleteObject`
@@ -201,10 +217,20 @@ This will show detailed information including:
   - `s3:GetBucketLocation`
   - `s3:GetBucketVersioning`
   - `s3:PutBucketVersioning`
+  - `s3:GetBucketObjectLockConfiguration`
   - `s3:DeleteBucketPolicy`
   - `s3:DeleteBucketLifecycle`
   - `s3:AbortMultipartUpload`
   - `s3:ListMultipartUploads`
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The tests use botocore's `Stubber`, an in-memory fake, and a local HTTP server; they make no calls to Wasabi.
 
 ## Contributing
 

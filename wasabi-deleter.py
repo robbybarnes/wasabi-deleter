@@ -13,35 +13,49 @@ License: MIT
 from __future__ import annotations
 
 import argparse
+import itertools
 import logging
 import os
+import random
 import sys
 import time
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 import boto3
 import botocore.config
 import botocore.exceptions
-import requests
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
 
 if TYPE_CHECKING:
-    from mypy_boto3_s3 import S3Client
     from boto3 import Session
+    from mypy_boto3_s3 import S3Client
 
 
-# === Logging Configuration ===
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger(__name__)
+
+# S3 error codes that indicate a transient condition worth retrying.
+RETRYABLE_ERROR_CODES = frozenset(
+    {
+        "InternalError",
+        "ServiceUnavailable",
+        "SlowDown",
+        "RequestTimeout",
+        "Throttling",
+        "ThrottlingException",
+    }
+)
+
+# S3 allows at most 1000 keys per DeleteObjects request.
+MAX_BATCH_SIZE = 1000
+
+# Safety cap on list/delete passes over a bucket.
+MAX_PASSES = 20
+
+
+class ConfigError(Exception):
+    """Raised when required configuration is missing or invalid."""
 
 
 @dataclass
@@ -67,13 +81,10 @@ class WasabiConfig:
         secret_key = os.environ.get("WASABI_SECRET_KEY", "")
 
         if not access_key or not secret_key:
-            logger.error("Wasabi credentials not found!")
-            logger.error(
-                "Please set WASABI_ACCESS_KEY and WASABI_SECRET_KEY environment variables"
+            raise ConfigError(
+                "Wasabi credentials not found. Set the WASABI_ACCESS_KEY and "
+                "WASABI_SECRET_KEY environment variables."
             )
-            logger.error("Example: export WASABI_ACCESS_KEY='your-access-key'")
-            logger.error("         export WASABI_SECRET_KEY='your-secret-key'")
-            sys.exit(1)
 
         return cls(access_key=access_key, secret_key=secret_key)
 
@@ -86,7 +97,6 @@ class DeletionStats:
     failed_deletes: int = 0
     retried_deletes: int = 0
     server_errors: int = 0
-    last_error_time: float = 0.0
     _lock: Lock = field(default_factory=Lock, repr=False, compare=False)
 
     def reset(self) -> None:
@@ -96,7 +106,6 @@ class DeletionStats:
             self.failed_deletes = 0
             self.retried_deletes = 0
             self.server_errors = 0
-            self.last_error_time = 0.0
 
     def increment_deleted(self, count: int = 1) -> None:
         """Thread-safe increment of deleted count."""
@@ -117,7 +126,19 @@ class DeletionStats:
         """Thread-safe recording of server error."""
         with self._lock:
             self.server_errors += 1
-            self.last_error_time = time.time()
+
+
+def endpoint_for_region(region: str) -> str:
+    """Return the Wasabi S3 endpoint URL for a region."""
+    if region == "us-east-1":
+        return "https://s3.wasabisys.com"
+    return f"https://s3.{region}.wasabisys.com"
+
+
+def _add_force_delete_param(request, **_kwargs) -> None:
+    """botocore before-sign hook that appends Wasabi's force_delete flag."""
+    separator = "&" if "?" in request.url else "?"
+    request.url = f"{request.url}{separator}force_delete=true"
 
 
 class WasabiBucketCleaner:
@@ -133,12 +154,6 @@ class WasabiBucketCleaner:
     """
 
     def __init__(self, config: WasabiConfig) -> None:
-        """
-        Initialize the bucket cleaner with configuration.
-
-        Args:
-            config: Wasabi configuration settings.
-        """
         self.config = config
         self.stats = DeletionStats()
         self._session: Session | None = None
@@ -173,77 +188,66 @@ class WasabiBucketCleaner:
         """Lazily create and cache default S3 client."""
         if self._s3_client is None:
             self._s3_client = self.session.client(
-                "s3", endpoint_url=self.config.endpoint_url, config=self.boto_config
+                "s3",
+                endpoint_url=self.config.endpoint_url,
+                region_name=self.config.region,
+                config=self.boto_config,
             )
         return self._s3_client
+
+    def _new_regional_client(self, region: str) -> S3Client:
+        """Create an S3 client that targets and signs for a specific region."""
+        return self.session.client(
+            "s3",
+            endpoint_url=endpoint_for_region(region),
+            region_name=region,
+            config=self.boto_config,
+        )
 
     def _get_bucket_region(self, bucket_name: str) -> str:
         """
         Determine the region of a Wasabi bucket.
 
         Wasabi buckets can be in different regions, and we need to use
-        the correct regional endpoint for optimal performance.
-
-        Args:
-            bucket_name: Name of the bucket.
-
-        Returns:
-            The region code (e.g., 'us-east-1', 'us-west-1').
+        the correct regional endpoint (and signing region) for each.
         """
         if bucket_name in self._bucket_region_cache:
             return self._bucket_region_cache[bucket_name]
 
         try:
             response = self.s3_client.get_bucket_location(Bucket=bucket_name)
-            location = response.get("LocationConstraint")
-            region = "us-east-1" if not location or location == "" else location
-            self._bucket_region_cache[bucket_name] = region
-            return region
+            region = response.get("LocationConstraint") or "us-east-1"
         except botocore.exceptions.ClientError as e:
-            logger.error(f"Failed to get region for bucket {bucket_name}: {e}")
-            return "us-east-1"
+            logger.warning(
+                f"Could not determine region for bucket {bucket_name} "
+                f"({e}); assuming us-east-1"
+            )
+            region = "us-east-1"
+
+        self._bucket_region_cache[bucket_name] = region
+        return region
 
     def _get_s3_client_for_bucket(self, bucket_name: str) -> S3Client:
-        """
-        Get or create an S3 client for the bucket's specific region.
-
-        Using region-specific endpoints improves performance and reliability.
-
-        Args:
-            bucket_name: Name of the bucket.
-
-        Returns:
-            Boto3 S3 client configured for the bucket's region.
-        """
+        """Get or create an S3 client for the bucket's specific region."""
         region = self._get_bucket_region(bucket_name)
-
-        if region in self._client_cache:
-            return self._client_cache[region]
-
-        if region == "us-east-1":
-            endpoint = "https://s3.wasabisys.com"
-        else:
-            endpoint = f"https://s3.{region}.wasabisys.com"
-
-        client = self.session.client(
-            "s3", endpoint_url=endpoint, config=self.boto_config
-        )
-        self._client_cache[region] = client
-        return client
+        if region not in self._client_cache:
+            self._client_cache[region] = self._new_regional_client(region)
+        return self._client_cache[region]
 
     def list_buckets(self) -> list[str]:
         """
         List all buckets in the Wasabi account.
 
-        Returns:
-            List of bucket names.
+        Raises:
+            botocore.exceptions.ClientError: If the listing fails.
         """
-        try:
-            response = self.s3_client.list_buckets()
-            return [bucket["Name"] for bucket in response.get("Buckets", [])]
-        except botocore.exceptions.ClientError as e:
-            logger.error(f"Failed to list buckets: {e}")
-            return []
+        response = self.s3_client.list_buckets()
+        return [bucket["Name"] for bucket in response.get("Buckets", [])]
+
+    def _backoff(self, attempt: int) -> float:
+        """Exponential backoff with jitter, capped at max_retry_delay."""
+        base = min(self.config.retry_delay * (2**attempt), self.config.max_retry_delay)
+        return base * random.uniform(0.5, 1.0)
 
     def _delete_object_batch_with_retry(
         self,
@@ -255,60 +259,23 @@ class WasabiBucketCleaner:
         """
         Delete a batch of objects with retry logic and error handling.
 
-        Handles various error conditions including MalformedXML errors,
-        server errors (500) with exponential backoff, request timeouts,
-        and rate limiting.
-
-        Args:
-            s3_client: Boto3 S3 client.
-            bucket_name: Name of the bucket.
-            objects_to_delete: List of objects to delete with Key and optional VersionId.
-            retry_count: Current retry attempt number.
+        Handles MalformedXML errors (falls back to per-object deletes),
+        transient server/throttling errors (exponential backoff, splitting
+        large batches), and per-key errors reported in the response.
 
         Returns:
             Tuple of (successfully deleted count, list of failed objects).
         """
+        if not objects_to_delete:
+            return 0, []
+
         time.sleep(self.config.rate_limit_delay)
 
         try:
-            for obj in objects_to_delete[:5]:
-                key = obj.get("Key", "")
-                if any(ord(c) < 32 or ord(c) > 126 for c in key):
-                    logger.debug(f"Object with special chars: {repr(key)}")
-
             response = s3_client.delete_objects(
                 Bucket=bucket_name,
                 Delete={"Objects": objects_to_delete, "Quiet": False},
             )
-
-            errors = response.get("Errors", [])
-            deleted = response.get("Deleted", [])
-
-            if errors:
-                logger.warning(f"Batch delete had {len(errors)} errors")
-                if retry_count < self.config.max_retries:
-                    delay = min(
-                        self.config.retry_delay * (2**retry_count) + (time.time() % 1),
-                        self.config.max_retry_delay,
-                    )
-                    time.sleep(delay)
-                    self.stats.increment_retried(len(errors))
-                    failed_objects = []
-                    for err in errors:
-                        if "Key" in err:
-                            obj_identifier = {"Key": err["Key"]}
-                            if version_id := err.get("VersionId"):
-                                obj_identifier["VersionId"] = version_id
-                            failed_objects.append(obj_identifier)
-                    return self._delete_object_batch_with_retry(
-                        s3_client, bucket_name, failed_objects, retry_count + 1
-                    )
-                else:
-                    self.stats.increment_failed(len(errors))
-                    return len(deleted), errors
-
-            return len(deleted), []
-
         except botocore.exceptions.ClientError as e:
             error_code = e.response.get("Error", {}).get("Code", "")
             status_code = e.response.get("ResponseMetadata", {}).get(
@@ -323,42 +290,28 @@ class WasabiBucketCleaner:
                     s3_client, bucket_name, objects_to_delete
                 )
 
-            if status_code == 500:
-                self.stats.record_server_error()
-                if retry_count < self.config.max_retries:
-                    delay = min(
-                        self.config.retry_delay * (3**retry_count) + (time.time() % 2),
-                        self.config.max_retry_delay,
-                    )
-                    logger.warning(
-                        f"Server error (500), retrying in {delay:.1f}s "
-                        f"(attempt {retry_count + 1}/{self.config.max_retries})"
-                    )
-                    time.sleep(delay)
-
-                    if len(objects_to_delete) > 100:
-                        mid = len(objects_to_delete) // 2
-                        logger.info(
-                            f"Splitting batch of {len(objects_to_delete)} objects"
-                        )
-                        deleted1, errors1 = self._delete_object_batch_with_retry(
-                            s3_client, bucket_name, objects_to_delete[:mid], retry_count + 1
-                        )
-                        deleted2, errors2 = self._delete_object_batch_with_retry(
-                            s3_client, bucket_name, objects_to_delete[mid:], retry_count + 1
-                        )
-                        return deleted1 + deleted2, errors1 + errors2
-                    else:
-                        return self._delete_object_batch_with_retry(
-                            s3_client, bucket_name, objects_to_delete, retry_count + 1
-                        )
-
-            if error_code == "RequestTimeout" and retry_count < self.config.max_retries:
-                delay = min(
-                    self.config.retry_delay * (2**retry_count),
-                    self.config.max_retry_delay,
+            retryable = status_code >= 500 or error_code in RETRYABLE_ERROR_CODES
+            if retryable and retry_count < self.config.max_retries:
+                if status_code >= 500:
+                    self.stats.record_server_error()
+                delay = self._backoff(retry_count)
+                logger.warning(
+                    f"{error_code or status_code} error, retrying in {delay:.1f}s "
+                    f"(attempt {retry_count + 1}/{self.config.max_retries})"
                 )
                 time.sleep(delay)
+
+                if len(objects_to_delete) > 100:
+                    mid = len(objects_to_delete) // 2
+                    logger.info(f"Splitting batch of {len(objects_to_delete)} objects")
+                    deleted1, failed1 = self._delete_object_batch_with_retry(
+                        s3_client, bucket_name, objects_to_delete[:mid], retry_count + 1
+                    )
+                    deleted2, failed2 = self._delete_object_batch_with_retry(
+                        s3_client, bucket_name, objects_to_delete[mid:], retry_count + 1
+                    )
+                    return deleted1 + deleted2, failed1 + failed2
+
                 return self._delete_object_batch_with_retry(
                     s3_client, bucket_name, objects_to_delete, retry_count + 1
                 )
@@ -366,6 +319,42 @@ class WasabiBucketCleaner:
             logger.error(f"Error deleting batch: {e}")
             self.stats.increment_failed(len(objects_to_delete))
             return 0, objects_to_delete
+
+        deleted_count = len(response.get("Deleted", []))
+        errors = response.get("Errors", [])
+        if not errors:
+            return deleted_count, []
+
+        retryable_objs: list[dict[str, str]] = []
+        permanent_objs: list[dict[str, str]] = []
+        for err in errors:
+            obj = {"Key": err.get("Key", "")}
+            if version_id := err.get("VersionId"):
+                obj["VersionId"] = version_id
+            if err.get("Code") in RETRYABLE_ERROR_CODES:
+                retryable_objs.append(obj)
+            else:
+                permanent_objs.append(obj)
+
+        if permanent_objs:
+            sample = errors[0]
+            logger.warning(
+                f"{len(permanent_objs)} object(s) could not be deleted, e.g. "
+                f"{sample.get('Key')!r}: {sample.get('Code')} - {sample.get('Message')}"
+            )
+            self.stats.increment_failed(len(permanent_objs))
+
+        if retryable_objs and retry_count < self.config.max_retries:
+            self.stats.increment_retried(len(retryable_objs))
+            time.sleep(self._backoff(retry_count))
+            more_deleted, still_failed = self._delete_object_batch_with_retry(
+                s3_client, bucket_name, retryable_objs, retry_count + 1
+            )
+            return deleted_count + more_deleted, permanent_objs + still_failed
+
+        if retryable_objs:
+            self.stats.increment_failed(len(retryable_objs))
+        return deleted_count, permanent_objs + retryable_objs
 
     def _delete_objects_individually(
         self,
@@ -376,11 +365,6 @@ class WasabiBucketCleaner:
         """
         Delete objects one by one as a fallback for batch failures.
 
-        Args:
-            s3_client: Boto3 S3 client.
-            bucket_name: Name of the bucket.
-            objects_to_delete: List of objects to delete.
-
         Returns:
             Tuple of (successfully deleted count, list of failed objects).
         """
@@ -390,14 +374,16 @@ class WasabiBucketCleaner:
         for obj in objects_to_delete:
             try:
                 delete_kwargs = {"Bucket": bucket_name, "Key": obj["Key"]}
-                if "VersionId" in obj and obj["VersionId"]:
+                if obj.get("VersionId"):
                     delete_kwargs["VersionId"] = obj["VersionId"]
                 s3_client.delete_object(**delete_kwargs)
                 deleted_count += 1
             except botocore.exceptions.ClientError as e:
-                logger.debug(f"Failed to delete {repr(obj.get('Key', ''))}: {e}")
+                logger.debug(f"Failed to delete {obj.get('Key', '')!r}: {e}")
                 failed_objects.append(obj)
 
+        if failed_objects:
+            self.stats.increment_failed(len(failed_objects))
         return deleted_count, failed_objects
 
     def _abort_incomplete_uploads(self, s3_client: S3Client, bucket_name: str) -> None:
@@ -405,71 +391,49 @@ class WasabiBucketCleaner:
         Abort all incomplete multipart uploads in parallel.
 
         Incomplete multipart uploads can prevent bucket deletion and consume storage.
-
-        Args:
-            s3_client: Boto3 S3 client.
-            bucket_name: Name of the bucket.
         """
         try:
             paginator = s3_client.get_paginator("list_multipart_uploads")
             uploads_to_abort = []
-
             for page in paginator.paginate(Bucket=bucket_name):
-                uploads = page.get("Uploads", [])
-                uploads_to_abort.extend(uploads)
-
-            if not uploads_to_abort:
-                return
-
-            logger.info(f"Found {len(uploads_to_abort)} incomplete uploads to abort")
-
-            def abort_upload(upload: dict) -> tuple[bool, str]:
-                try:
-                    s3_client.abort_multipart_upload(
-                        Bucket=bucket_name,
-                        Key=upload["Key"],
-                        UploadId=upload["UploadId"],
-                    )
-                    return True, upload["Key"]
-                except botocore.exceptions.ClientError as e:
-                    return False, f"{upload['Key']} - {e}"
-
-            worker_count = min(10, len(uploads_to_abort))
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = [
-                    executor.submit(abort_upload, upload) for upload in uploads_to_abort
-                ]
-
-                aborted = 0
-                failed = 0
-                for future in as_completed(futures):
-                    success, key = future.result()
-                    if success:
-                        aborted += 1
-                    else:
-                        failed += 1
-                        logger.warning(f"Failed to abort upload: {key}")
-
-                logger.info(f"Aborted {aborted} uploads, {failed} failed")
-
+                uploads_to_abort.extend(page.get("Uploads", []))
         except botocore.exceptions.ClientError as e:
             logger.error(f"Error listing multipart uploads: {e}")
+            return
+
+        if not uploads_to_abort:
+            return
+
+        logger.info(f"Found {len(uploads_to_abort)} incomplete uploads to abort")
+
+        def abort_upload(upload: dict) -> tuple[bool, str]:
+            try:
+                s3_client.abort_multipart_upload(
+                    Bucket=bucket_name,
+                    Key=upload["Key"],
+                    UploadId=upload["UploadId"],
+                )
+                return True, upload["Key"]
+            except botocore.exceptions.ClientError as e:
+                return False, f"{upload['Key']} - {e}"
+
+        aborted = failed = 0
+        worker_count = min(self.config.max_workers, len(uploads_to_abort))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for success, key in executor.map(abort_upload, uploads_to_abort):
+                if success:
+                    aborted += 1
+                else:
+                    failed += 1
+                    logger.warning(f"Failed to abort upload: {key}")
+
+        logger.info(f"Aborted {aborted} uploads, {failed} failed")
 
     def _check_bucket_versioning(self, s3_client: S3Client, bucket_name: str) -> bool:
-        """
-        Check if bucket versioning is enabled.
-
-        Args:
-            s3_client: Boto3 S3 client.
-            bucket_name: Name of the bucket.
-
-        Returns:
-            True if versioning is enabled, False otherwise.
-        """
+        """Return True if bucket versioning is enabled."""
         try:
             response = s3_client.get_bucket_versioning(Bucket=bucket_name)
-            status = response.get("Status", "Disabled")
-            return status == "Enabled"
+            return response.get("Status") == "Enabled"
         except botocore.exceptions.ClientError as e:
             logger.error(f"Error checking versioning status: {e}")
             return False
@@ -478,38 +442,23 @@ class WasabiBucketCleaner:
         self, s3_client: S3Client, bucket_name: str
     ) -> bool:
         """
-        Disable (suspend) bucket versioning.
+        Suspend bucket versioning.
 
         This doesn't delete existing versions, but prevents new versions
         from being created during the deletion process.
-
-        Args:
-            s3_client: Boto3 S3 client.
-            bucket_name: Name of the bucket.
-
-        Returns:
-            True if successful, False otherwise.
         """
         try:
             s3_client.put_bucket_versioning(
                 Bucket=bucket_name, VersioningConfiguration={"Status": "Suspended"}
             )
-            logger.info(f"Disabled versioning for bucket: {bucket_name}")
+            logger.info(f"Suspended versioning for bucket: {bucket_name}")
             return True
         except botocore.exceptions.ClientError as e:
-            logger.error(f"Failed to disable versioning: {e}")
+            logger.error(f"Failed to suspend versioning: {e}")
             return False
 
     def _delete_bucket_policy(self, s3_client: S3Client, bucket_name: str) -> None:
-        """
-        Delete bucket policy if it exists.
-
-        Bucket policies might prevent deletion operations.
-
-        Args:
-            s3_client: Boto3 S3 client.
-            bucket_name: Name of the bucket.
-        """
+        """Delete the bucket policy, which might otherwise deny deletions."""
         try:
             s3_client.delete_bucket_policy(Bucket=bucket_name)
             logger.info(f"Deleted bucket policy for: {bucket_name}")
@@ -518,15 +467,7 @@ class WasabiBucketCleaner:
                 logger.warning(f"Could not delete bucket policy: {e}")
 
     def _delete_bucket_lifecycle(self, s3_client: S3Client, bucket_name: str) -> None:
-        """
-        Delete bucket lifecycle configuration if it exists.
-
-        Lifecycle rules might interfere with deletion operations.
-
-        Args:
-            s3_client: Boto3 S3 client.
-            bucket_name: Name of the bucket.
-        """
+        """Delete the lifecycle configuration, which might interfere with deletion."""
         try:
             s3_client.delete_bucket_lifecycle(Bucket=bucket_name)
             logger.info(f"Deleted lifecycle configuration for: {bucket_name}")
@@ -535,18 +476,7 @@ class WasabiBucketCleaner:
                 logger.warning(f"Could not delete lifecycle configuration: {e}")
 
     def _check_object_lock(self, s3_client: S3Client, bucket_name: str) -> bool:
-        """
-        Check if bucket has object lock enabled.
-
-        Object lock can prevent deletion of objects.
-
-        Args:
-            s3_client: Boto3 S3 client.
-            bucket_name: Name of the bucket.
-
-        Returns:
-            True if object lock is enabled, False otherwise.
-        """
+        """Return True if the bucket has (or may have) object lock enabled."""
         try:
             response = s3_client.get_object_lock_configuration(Bucket=bucket_name)
             return "ObjectLockConfiguration" in response
@@ -557,55 +487,116 @@ class WasabiBucketCleaner:
             return True
 
     def _verify_bucket_empty(self, s3_client: S3Client, bucket_name: str) -> bool:
-        """
-        Verify that a bucket is completely empty.
-
-        Checks for regular objects, object versions, and delete markers.
-
-        Args:
-            s3_client: Boto3 S3 client.
-            bucket_name: Name of the bucket.
-
-        Returns:
-            True if bucket is empty, False otherwise.
-        """
+        """Return True if the bucket has no objects, versions, or delete markers."""
         try:
-            response = s3_client.list_objects_v2(Bucket=bucket_name, MaxKeys=1)
-            if response.get("KeyCount", 0) > 0:
-                return False
-
             response = s3_client.list_object_versions(Bucket=bucket_name, MaxKeys=1)
-            if response.get("Versions", []) or response.get("DeleteMarkers", []):
-                return False
-
-            return True
+            return not (response.get("Versions") or response.get("DeleteMarkers"))
         except botocore.exceptions.ClientError as e:
             logger.error(f"Error verifying bucket is empty: {e}")
             return False
+
+    def _iter_version_batches(
+        self, s3_client: S3Client, bucket_name: str
+    ) -> Iterator[list[dict[str, str]]]:
+        """Stream every object version and delete marker in batch-sized chunks."""
+        paginator = s3_client.get_paginator("list_object_versions")
+        batch: list[dict[str, str]] = []
+        for page in paginator.paginate(
+            Bucket=bucket_name, PaginationConfig={"PageSize": 1000}
+        ):
+            for item in itertools.chain(
+                page.get("Versions", []), page.get("DeleteMarkers", [])
+            ):
+                batch.append({"Key": item["Key"], "VersionId": item["VersionId"]})
+                if len(batch) >= self.config.batch_size:
+                    yield batch
+                    batch = []
+        if batch:
+            yield batch
+
+    def _delete_pass(
+        self, s3_client: S3Client, bucket_name: str, start_time: float
+    ) -> tuple[int, int]:
+        """
+        Make one list-and-delete pass over the bucket.
+
+        Listing and deletion are pipelined: batches are submitted to the worker
+        pool as pages arrive, with a bounded number in flight, so memory use
+        stays flat regardless of bucket size.
+
+        Returns:
+            Tuple of (objects found, objects deleted) in this pass.
+
+        Raises:
+            botocore.exceptions.ClientError: If listing the bucket fails.
+        """
+        workers = self.config.max_workers
+        if self.stats.server_errors > 10:
+            workers = max(2, workers // 2)
+            logger.warning(f"Reducing workers to {workers} due to server errors")
+
+        found = deleted = completed = 0
+        in_flight: set[Future] = set()
+
+        def collect(done: set[Future]) -> None:
+            nonlocal deleted, completed
+            for future in done:
+                count, _ = future.result()
+                deleted += count
+                completed += 1
+                self.stats.increment_deleted(count)
+                if completed % 10 == 0:
+                    elapsed = time.time() - start_time
+                    rate = self.stats.total_deleted / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        f"Progress: {completed} batches | "
+                        f"Total deleted: {self.stats.total_deleted} | "
+                        f"Rate: {rate:.1f} objects/sec"
+                    )
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            try:
+                for batch in self._iter_version_batches(s3_client, bucket_name):
+                    found += len(batch)
+                    if len(in_flight) >= workers * 2:
+                        done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                        collect(done)
+                    in_flight.add(
+                        executor.submit(
+                            self._delete_object_batch_with_retry,
+                            s3_client,
+                            bucket_name,
+                            batch,
+                        )
+                    )
+            finally:
+                done, _ = wait(in_flight)
+                collect(done)
+
+        return found, deleted
 
     def delete_all_objects(self, bucket_name: str) -> bool:
         """
         Delete all objects in a bucket, including versions and delete markers.
 
         This method:
-        1. Checks and disables versioning if enabled
+        1. Checks and suspends versioning if enabled
         2. Removes bucket policies and lifecycle rules
         3. Aborts incomplete multipart uploads
-        4. Deletes all objects, versions, and delete markers in parallel
-        5. Performs final verification and cleanup
-
-        Args:
-            bucket_name: Name of the bucket to clear.
+        4. Deletes all objects, versions, and delete markers in parallel,
+           re-scanning until nothing is left or no progress is made
+        5. Verifies the bucket is empty
 
         Returns:
-            True if all objects were deleted successfully, False otherwise.
+            True if the bucket is verified empty, False otherwise.
         """
-        logger.info(f"\n{'=' * 50}")
+        logger.info("=" * 50)
         logger.info(f"Deleting all objects in bucket: {bucket_name}")
-        logger.info(f"{'=' * 50}")
+        logger.info("=" * 50)
 
         s3_client = self._get_s3_client_for_bucket(bucket_name)
         start_time = time.time()
+        self.stats.reset()
 
         if self._check_object_lock(s3_client, bucket_name):
             logger.warning(
@@ -614,200 +605,73 @@ class WasabiBucketCleaner:
             )
 
         if self._check_bucket_versioning(s3_client, bucket_name):
-            logger.info(
-                f"Bucket '{bucket_name}' has versioning enabled. Suspending..."
-            )
+            logger.info(f"Bucket '{bucket_name}' has versioning enabled. Suspending...")
             self._disable_bucket_versioning(s3_client, bucket_name)
 
         self._delete_bucket_policy(s3_client, bucket_name)
         self._delete_bucket_lifecycle(s3_client, bucket_name)
-        self.stats.reset()
         self._abort_incomplete_uploads(s3_client, bucket_name)
 
-        iteration = 0
-        while True:
-            iteration += 1
-            logger.info(f"\nIteration {iteration} - Scanning for objects...")
-
-            paginator = s3_client.get_paginator("list_object_versions")
-            page_config = {"PageSize": 1000}
-
-            batches_queue: deque[list[dict[str, str]]] = deque()
-            total_found = 0
-
+        for pass_number in range(1, MAX_PASSES + 1):
+            logger.info(f"Pass {pass_number} - scanning for objects...")
             try:
-                for page in paginator.paginate(
-                    Bucket=bucket_name, PaginationConfig=page_config
-                ):
-                    versions = page.get("Versions", [])
-                    markers = page.get("DeleteMarkers", [])
-
-                    objects_to_delete = [
-                        {"Key": v["Key"], "VersionId": v["VersionId"]}
-                        for v in versions
-                    ] + [
-                        {"Key": m["Key"], "VersionId": m["VersionId"]}
-                        for m in markers
-                    ]
-
-                    for i in range(0, len(objects_to_delete), self.config.batch_size):
-                        batch = objects_to_delete[i : i + self.config.batch_size]
-                        batches_queue.append(batch)
-                        total_found += len(batch)
-
+                found, deleted = self._delete_pass(s3_client, bucket_name, start_time)
             except botocore.exceptions.ClientError as e:
                 logger.error(f"Error listing objects: {e}")
                 return False
 
-            if not batches_queue:
+            if found == 0:
                 logger.info("No more objects to delete")
                 break
 
-            logger.info(f"Found {total_found} objects in {len(batches_queue)} batches")
-
-            batch_deleted = 0
-            current_workers = self.config.max_workers
-            if self.stats.server_errors > 10:
-                current_workers = max(2, self.config.max_workers // 2)
-                logger.warning(
-                    f"Reducing workers to {current_workers} due to server errors"
-                )
-
-            with ThreadPoolExecutor(max_workers=current_workers) as executor:
-                futures = []
-                submitted = 0
-
-                while batches_queue:
-                    if self.stats.last_error_time > time.time() - 60:
-                        time.sleep(0.5)
-
-                    batch = batches_queue.popleft()
-                    future = executor.submit(
-                        self._delete_object_batch_with_retry,
-                        s3_client,
-                        bucket_name,
-                        batch,
-                    )
-                    futures.append(future)
-                    submitted += 1
-
-                    if submitted % current_workers == 0:
-                        time.sleep(0.2)
-
-                completed = 0
-                for future in as_completed(futures):
-                    deleted, _ = future.result()
-                    batch_deleted += deleted
-                    self.stats.increment_deleted(deleted)
-                    completed += 1
-
-                    if completed % 10 == 0:
-                        elapsed = time.time() - start_time
-                        rate = (
-                            self.stats.total_deleted / elapsed if elapsed > 0 else 0
-                        )
-                        logger.info(
-                            f"Progress: {completed}/{len(futures)} batches | "
-                            f"Total deleted: {self.stats.total_deleted} | "
-                            f"Rate: {rate:.1f} objects/sec"
-                        )
-
-            if batch_deleted == 0:
-                logger.info("No objects were deleted in this iteration")
+            logger.info(f"Pass {pass_number} complete: {deleted}/{found} deleted")
+            if deleted == 0:
+                logger.warning("No progress made in this pass; giving up")
                 break
+        else:
+            logger.warning(f"Stopped after {MAX_PASSES} passes")
 
-            logger.info(f"Iteration {iteration} complete: {batch_deleted} objects deleted")
-
+        # Uploads may have been started while we were deleting.
         self._abort_incomplete_uploads(s3_client, bucket_name)
 
-        logger.info("Verifying bucket is completely empty...")
-        if not self._verify_bucket_empty(s3_client, bucket_name):
-            logger.warning(
-                "Bucket still contains objects or delete markers after deletion"
-            )
-            logger.info("Attempting final cleanup pass...")
-            self._final_cleanup(s3_client, bucket_name)
-
-        elapsed = time.time() - start_time
-        self._log_statistics(bucket_name, elapsed)
+        self._log_statistics(bucket_name, time.time() - start_time)
 
         is_empty = self._verify_bucket_empty(s3_client, bucket_name)
         if is_empty:
             logger.info("Bucket is verified empty")
         else:
-            logger.warning("Bucket may still contain objects")
-
-        return self.stats.failed_deletes == 0 and is_empty
-
-    def _final_cleanup(self, s3_client: S3Client, bucket_name: str) -> None:
-        """
-        Perform a final aggressive cleanup of remaining objects.
-
-        Args:
-            s3_client: Boto3 S3 client.
-            bucket_name: Name of the bucket.
-        """
-        paginator = s3_client.get_paginator("list_object_versions")
-        remaining_objects: list[dict[str, str]] = []
-
-        for page in paginator.paginate(
-            Bucket=bucket_name, PaginationConfig={"PageSize": 1000}
-        ):
-            for v in page.get("Versions", []):
-                remaining_objects.append({"Key": v["Key"], "VersionId": v["VersionId"]})
-            for m in page.get("DeleteMarkers", []):
-                remaining_objects.append({"Key": m["Key"], "VersionId": m["VersionId"]})
-
-        if remaining_objects:
-            logger.info(f"Found {len(remaining_objects)} remaining objects/markers")
-            for i in range(0, len(remaining_objects), 100):
-                batch = remaining_objects[i : i + 100]
-                try:
-                    s3_client.delete_objects(
-                        Bucket=bucket_name, Delete={"Objects": batch, "Quiet": False}
-                    )
-                except botocore.exceptions.ClientError as e:
-                    logger.error(f"Final cleanup error: {e}")
+            logger.warning("Bucket still contains objects or delete markers")
+        return is_empty
 
     def _log_statistics(self, bucket_name: str, elapsed: float) -> None:
-        """
-        Log deletion statistics.
-
-        Args:
-            bucket_name: Name of the bucket.
-            elapsed: Time elapsed in seconds.
-        """
+        """Log deletion statistics."""
         rate = self.stats.total_deleted / elapsed if elapsed > 0 else 0
-        logger.info(f"\n{'=' * 50}")
-        logger.info(f"Bucket '{bucket_name}' clearing completed!")
+        logger.info("=" * 50)
+        logger.info(f"Bucket '{bucket_name}' clearing completed")
         logger.info(f"Total objects deleted: {self.stats.total_deleted}")
         logger.info(f"Failed deletes: {self.stats.failed_deletes}")
         logger.info(f"Retried deletes: {self.stats.retried_deletes}")
         logger.info(f"Server errors encountered: {self.stats.server_errors}")
         logger.info(f"Time elapsed: {elapsed:.2f} seconds")
         logger.info(f"Average rate: {rate:.1f} objects/sec")
-        logger.info(f"{'=' * 50}\n")
+        logger.info("=" * 50)
 
     def delete_bucket(self, bucket_name: str, force: bool = False) -> bool:
         """
-        Delete a bucket, optionally using Wasabi's force_delete parameter.
-
-        The force_delete parameter is Wasabi-specific and attempts to delete
-        all objects in the bucket before deleting the bucket itself.
+        Delete a bucket.
 
         Args:
             bucket_name: Name of the bucket to delete.
-            force: Whether to use force_delete parameter.
+            force: Use Wasabi's force_delete parameter, which deletes any
+                remaining objects server-side along with the bucket.
 
         Returns:
-            True if deletion was successful, False otherwise.
+            True if deletion was successful (or the bucket no longer exists).
         """
-        s3_client = self._get_s3_client_for_bucket(bucket_name)
-
         if force:
-            if self._force_delete_bucket(bucket_name):
-                return True
+            return self._force_delete_bucket(bucket_name)
 
+        s3_client = self._get_s3_client_for_bucket(bucket_name)
         for attempt in range(self.config.max_retries):
             try:
                 s3_client.delete_bucket(Bucket=bucket_name)
@@ -816,92 +680,75 @@ class WasabiBucketCleaner:
             except botocore.exceptions.ClientError as e:
                 error_code = e.response["Error"]["Code"]
                 if error_code == "BucketNotEmpty":
-                    logger.error(
-                        f"Bucket '{bucket_name}' is not empty. "
-                        "Please delete all objects first."
-                    )
+                    logger.error(f"Bucket '{bucket_name}' is not empty.")
                     return False
-                elif error_code == "NoSuchBucket":
+                if error_code == "NoSuchBucket":
                     logger.warning(f"Bucket '{bucket_name}' does not exist.")
                     return True
-                else:
-                    logger.error(f"Attempt {attempt + 1} failed to delete bucket: {e}")
-                    if attempt < self.config.max_retries - 1:
-                        time.sleep(self.config.retry_delay * (attempt + 1))
-                    else:
-                        return False
+                logger.error(f"Attempt {attempt + 1} failed to delete bucket: {e}")
+                if attempt < self.config.max_retries - 1:
+                    time.sleep(self.config.retry_delay * (attempt + 1))
         return False
 
     def _force_delete_bucket(self, bucket_name: str) -> bool:
         """
-        Attempt force deletion of a bucket using Wasabi's special parameter.
+        Delete a bucket using Wasabi's force_delete query parameter.
 
-        Args:
-            bucket_name: Name of the bucket to delete.
-
-        Returns:
-            True if successful, False otherwise.
+        The parameter is injected before signing, so botocore produces a
+        correct S3 SigV4 signature (including X-Amz-Content-SHA256).
         """
+        region = self._get_bucket_region(bucket_name)
+        client = self._new_regional_client(region)
+        client.meta.events.register(
+            "before-sign.s3.DeleteBucket", _add_force_delete_param
+        )
         try:
-            region = self._get_bucket_region(bucket_name)
-            if region == "us-east-1":
-                endpoint = "https://s3.wasabisys.com"
-            else:
-                endpoint = f"https://s3.{region}.wasabisys.com"
-
-            url = f"{endpoint}/{bucket_name}?force_delete=true"
-            request = AWSRequest(method="DELETE", url=url)
-            SigV4Auth(self.session.get_credentials(), "s3", region).add_auth(request)
-
-            prepared_request = request.prepare()
-            response = requests.delete(
-                prepared_request.url,
-                headers=dict(prepared_request.headers),
-                timeout=30,
-            )
-
-            if response.status_code == 204:
-                logger.info(f"Successfully force-deleted bucket: {bucket_name}")
+            client.delete_bucket(Bucket=bucket_name)
+            logger.info(f"Successfully force-deleted bucket: {bucket_name}")
+            return True
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchBucket":
+                logger.warning(f"Bucket '{bucket_name}' does not exist.")
                 return True
-            else:
-                logger.warning(
-                    f"Force delete returned status {response.status_code}: "
-                    f"{response.text}"
-                )
-        except requests.RequestException as e:
-            logger.warning(f"Force delete failed: {e}")
-        return False
+            logger.error(f"Force delete failed: {e}")
+            return False
 
 
 def confirm(prompt: str) -> bool:
-    """
-    Get user confirmation for destructive operations.
-
-    Args:
-        prompt: The confirmation prompt to display.
-
-    Returns:
-        True if user confirms, False otherwise.
-    """
-    ans = input(f"{prompt} (y/N): ").strip().lower()
+    """Ask the user a yes/no question; anything but 'y' (including EOF) is no."""
+    try:
+        ans = input(f"{prompt} (y/N): ").strip().lower()
+    except EOFError:
+        return False
     return ans == "y"
 
 
-def parse_arguments() -> argparse.Namespace:
-    """
-    Parse command line arguments.
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
 
-    Returns:
-        Parsed arguments namespace.
-    """
+
+def _batch_size(value: str) -> int:
+    number = _positive_int(value)
+    if number > MAX_BATCH_SIZE:
+        raise argparse.ArgumentTypeError(f"must be at most {MAX_BATCH_SIZE}")
+    return number
+
+
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Wasabi Bucket Cleaner - Delete Wasabi S3 buckets and their contents",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                          Interactive mode - list and select buckets
+  %(prog)s                          Interactive mode - confirm each bucket
   %(prog)s --bucket my-bucket       Delete specific bucket
+  %(prog)s -b one -b two            Delete several specific buckets
   %(prog)s --bucket my-bucket --yes Skip confirmation prompts
+  %(prog)s --all --yes              Delete EVERY bucket without prompting
   %(prog)s --list                   List all buckets without deleting
 
 Environment Variables:
@@ -910,7 +757,17 @@ Environment Variables:
         """,
     )
     parser.add_argument(
-        "--bucket", "-b", type=str, help="Specific bucket to delete"
+        "--bucket",
+        "-b",
+        action="append",
+        metavar="BUCKET",
+        help="Bucket to delete (repeatable)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Target every bucket in the account (required with --yes "
+        "when no --bucket is given)",
     )
     parser.add_argument(
         "--yes", "-y", action="store_true", help="Skip confirmation prompts"
@@ -922,97 +779,156 @@ Environment Variables:
         "--force",
         "-f",
         action="store_true",
-        help="Use Wasabi force_delete if standard delete fails",
+        help="Use Wasabi force_delete if the bucket cannot be emptied or "
+        "standard delete fails",
     )
     parser.add_argument(
         "--workers",
         "-w",
-        type=int,
+        type=_positive_int,
         default=10,
         help="Number of concurrent workers (default: 10)",
     )
     parser.add_argument(
+        "--batch-size",
+        type=_batch_size,
+        default=500,
+        help=f"Objects per delete request, 1-{MAX_BATCH_SIZE} (default: 500)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable verbose logging"
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.bucket and args.all:
+        parser.error("--bucket and --all are mutually exclusive")
+    if args.yes and not args.bucket and not args.all and not args.list:
+        parser.error(
+            "refusing to delete every bucket with --yes; "
+            "pass --bucket NAME, or --all to really delete everything"
+        )
+    return args
 
 
-def main() -> None:
-    """Main function that orchestrates the bucket deletion process."""
-    args = parse_arguments()
+def process_bucket(
+    cleaner: WasabiBucketCleaner,
+    bucket: str,
+    *,
+    force: bool,
+    confirm_bucket_delete: bool,
+) -> bool:
+    """
+    Empty and delete one bucket.
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    Returns:
+        True if the bucket was deleted or the user chose to keep it.
+    """
+    emptied = cleaner.delete_all_objects(bucket)
 
-    config = WasabiConfig.from_environment()
+    if not emptied and not force:
+        logger.error(
+            f"Bucket '{bucket}' could not be fully emptied; not deleting it. "
+            "Re-run, or use --force to let Wasabi delete the remainder."
+        )
+        return False
+
+    if confirm_bucket_delete and not confirm(f"Proceed to DELETE the bucket '{bucket}'?"):
+        logger.info(f"Skipped bucket deletion: {bucket}")
+        return True
+
+    if emptied and cleaner.delete_bucket(bucket):
+        return True
+
+    if force:
+        logger.warning("Trying Wasabi force delete...")
+        return cleaner.delete_bucket(bucket, force=True)
+    return False
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Orchestrate the bucket deletion process. Returns a process exit code."""
+    args = parse_arguments(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    try:
+        config = WasabiConfig.from_environment()
+    except ConfigError as e:
+        logger.error(str(e))
+        return 1
     config.max_workers = args.workers
+    config.batch_size = args.batch_size
 
     cleaner = WasabiBucketCleaner(config)
 
     try:
-        buckets = cleaner.list_buckets()
+        try:
+            buckets = cleaner.list_buckets()
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
+            logger.error(f"Failed to list buckets: {e}")
+            return 1
+
         if not buckets:
             logger.info("No buckets found.")
-            return
+            return 0
 
         if args.list:
-            logger.info("\n=== Buckets Found ===")
+            logger.info("=== Buckets Found ===")
             for i, bucket in enumerate(buckets, 1):
                 logger.info(f"{i}. {bucket}")
-            return
+            return 0
 
         if args.bucket:
-            if args.bucket not in buckets:
-                logger.error(f"Bucket '{args.bucket}' not found.")
-                sys.exit(1)
-            buckets = [args.bucket]
+            missing = [b for b in args.bucket if b not in buckets]
+            if missing:
+                logger.error(f"Bucket(s) not found: {', '.join(missing)}")
+                return 1
+            buckets = list(dict.fromkeys(args.bucket))
 
-        logger.info("\n=== Buckets Found ===")
+        logger.info("=== Buckets Selected ===")
         for i, bucket in enumerate(buckets, 1):
             logger.info(f"{i}. {bucket}")
 
+        failures: list[str] = []
+        delete_everything = False
         if len(buckets) > 1 and not args.bucket:
-            if args.yes or confirm(
+            delete_everything = args.yes or confirm(
                 f"\nDelete ALL {len(buckets)} buckets and their contents?"
-            ):
-                for bucket in buckets:
-                    logger.info(f"\nProcessing bucket: {bucket}")
-                    if cleaner.delete_all_objects(bucket):
-                        time.sleep(0.5)
-                        if not cleaner.delete_bucket(bucket):
-                            if args.force:
-                                logger.warning(
-                                    "Standard delete failed. Trying force delete..."
-                                )
-                                cleaner.delete_bucket(bucket, force=True)
-                return
+            )
 
         for bucket in buckets:
-            if args.yes or confirm(
-                f"\nDelete bucket '{bucket}' and ALL its contents?"
-            ):
-                if cleaner.delete_all_objects(bucket):
-                    time.sleep(0.5)
-                    if args.yes or confirm(
-                        f"Proceed to DELETE the bucket '{bucket}'?"
-                    ):
-                        if not cleaner.delete_bucket(bucket):
-                            if args.force:
-                                logger.warning(
-                                    "Standard delete failed. Trying force delete..."
-                                )
-                                cleaner.delete_bucket(bucket, force=True)
-                    else:
-                        logger.info(f"Skipped bucket deletion: {bucket}")
+            if delete_everything or args.yes:
+                selected = True
             else:
+                selected = confirm(f"\nDelete bucket '{bucket}' and ALL its contents?")
+            if not selected:
                 logger.info(f"Skipped: {bucket}")
+                continue
 
-        logger.info("\nOperation completed successfully!")
+            logger.info(f"Processing bucket: {bucket}")
+            ok = process_bucket(
+                cleaner,
+                bucket,
+                force=args.force,
+                confirm_bucket_delete=not (args.yes or delete_everything),
+            )
+            if not ok:
+                failures.append(bucket)
+
+        if failures:
+            logger.error(f"Finished with failures: {', '.join(failures)}")
+            return 1
+        logger.info("Operation completed successfully!")
+        return 0
 
     except KeyboardInterrupt:
-        logger.warning("\n\nOperation interrupted by user")
-        sys.exit(1)
+        logger.warning("Operation interrupted by user")
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
